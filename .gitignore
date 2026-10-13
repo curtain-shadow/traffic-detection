@@ -10,3 +10,7 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 运行时生成（数据与模型，经 train.py 重新生成）
+data/
+models/

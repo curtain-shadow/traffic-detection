@@ -1,175 +1,137 @@
-"""恶意网络流量检测 —— 数据加载 + 特征工程 + 模型训练"""
+"""恶意网络流量检测 —— UNSW-NB15 真实数据训练（RF vs XGBoost 对比）"""
+import os, json, urllib.request
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import xgboost as xgb
 import joblib
-import os
-import urllib.request
-import zipfile
 
 DATA_DIR = "data"
 MODEL_DIR = "models"
+CSV_PATH = os.path.join(DATA_DIR, "UNSW_NB15_training-set.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+URLS = [
+    "https://hf-mirror.com/datasets/jharrrry/UNSW-NB15/resolve/main/train.csv",
+    "https://huggingface.co/datasets/jharrrry/UNSW-NB15/resolve/main/train.csv",
+]
+
 
 def download_dataset():
-    """下载 UNSW-NB15 数据集（比 CIC-IDS 小且更适合实验）"""
-    print("下载数据集...")
-
-    # 使用 UNSW-NB15 训练集（CSV 格式，约 175K 样本）
-    url = "https://cloudstor.aarnet.edu.au/plus/s/2DhnLGDdEECo4ys/download"
-    csv_path = os.path.join(DATA_DIR, "UNSW_NB15_training-set.csv")
-
-    if os.path.exists(csv_path):
-        print(f"数据集已存在: {csv_path}")
-        return csv_path
-
-    # 备用：生成合成数据集用于演示
-    print("下载失败，生成合成数据集用于演示...")
-    return generate_synthetic()
-
-
-def generate_synthetic():
-    """生成合成网络流量数据用于演示"""
-    csv_path = os.path.join(DATA_DIR, "synthetic_traffic.csv")
-    if os.path.exists(csv_path):
-        return csv_path
-
-    np.random.seed(42)
-    n = 5000
-
-    data = {
-        'duration': np.random.exponential(100, n),
-        'protocol_type': np.random.choice(['tcp', 'udp', 'icmp'], n),
-        'src_bytes': np.random.exponential(500, n),
-        'dst_bytes': np.random.exponential(400, n),
-        'src_packets': np.random.poisson(10, n),
-        'dst_packets': np.random.poisson(8, n),
-        'port_src': np.random.randint(1024, 65535, n),
-        'port_dst': np.random.choice([80, 443, 22, 21, 25, 53, 8080], n),
-        'tcp_flags': np.random.randint(0, 64, n),
-        'packet_size_mean': np.random.normal(200, 80, n),
-        'packet_size_std': np.random.exponential(50, n),
-        'flow_rate': np.random.exponential(0.5, n),
-        'syn_count': np.random.poisson(2, n),
-        'ack_count': np.random.poisson(5, n),
-        'fin_count': np.random.poisson(1, n),
-        'rst_count': np.random.poisson(0.3, n),
-        'urg_count': np.random.poisson(0.1, n),
-        'http_method': np.random.choice(['GET', 'POST', 'PUT', 'HEAD', 'OPTIONS'], n),
-        'dns_query_len': np.random.exponential(20, n),
-        'dns_response_len': np.random.exponential(50, n),
-    }
-
-    df = pd.DataFrame(data)
-
-    # 生成标签：基于特征组合判定是否为恶意流量
-    malicious = (
-        (df['syn_count'] > 5) & (df['src_bytes'] < 100) |
-        (df['port_dst'].isin([22, 21])) & (df['rst_count'] > 1) |
-        (df['port_dst'] == 53) & (df['dns_query_len'] > 50) |
-        (df['tcp_flags'] > 50) & (df['flow_rate'] > 2) |
-        (df['rst_count'] > 2)
-    )
-    df['label'] = (malicious).astype(int)
-
-    df.to_csv(csv_path, index=False)
-    print(f"合成数据集已保存: {csv_path} ({n} 样本, 恶意占比 {df['label'].mean():.1%})")
-    return csv_path
+    if os.path.exists(CSV_PATH):
+        print(f"数据集已存在: {CSV_PATH}")
+        return CSV_PATH
+    for url in URLS:
+        try:
+            print(f"下载数据集: {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=180) as r, open(CSV_PATH, "wb") as f:
+                f.write(r.read())
+            print(f"下载完成 -> {CSV_PATH}")
+            return CSV_PATH
+        except Exception as e:
+            print(f"  [失败] {e}")
+    raise SystemExit("UNSW-NB15 下载失败：请手动下载 train.csv 放到 data/UNSW_NB15_training-set.csv 后重试")
 
 
 def preprocess(df):
-    """特征工程：编码、标准化"""
     df = df.copy()
-
-    # 处理类别型特征
-    cat_cols = df.select_dtypes(include=['object']).columns
-    for col in cat_cols:
-        if col != 'label':
-            df[col] = LabelEncoder().fit_transform(df[col].astype(str))
-
-    # 分离特征和标签
-    if 'label' in df.columns:
-        y = df['label']
-        X = df.drop(columns=['label'])
-    else:
-        y = None
-        X = df
-
-    # 标准化
+    df = df.drop(columns=[c for c in ("id", "attack_cat") if c in df.columns])
+    y = df["label"].values
+    X = df.drop(columns=["label"])
+    encoders = {}
+    for col in X.select_dtypes(exclude="number").columns:
+        le = LabelEncoder()
+        X[col] = le.fit_transform(X[col].astype(str))
+        encoders[col] = le
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X.fillna(0))
+    return X_scaled, y, scaler, list(X.columns), encoders
 
-    return X_scaled, y, scaler, list(X.columns)
+
+def build_ui_meta(df, encoders):
+    df = df.drop(columns=[c for c in ("id", "attack_cat") if c in df.columns])
+    X = df.drop(columns=["label"])
+    defaults, cat_values = {}, {}
+    for col in X.columns:
+        if col in encoders:
+            defaults[col] = X[col].mode()[0]
+            cat_values[col] = encoders[col].classes_.tolist()
+        else:
+            defaults[col] = float(np.median(X[col]))
+    # 正常 / 恶意 各取一条示例（保留类别原始字符串）
+    normal = df[df["label"] == 0].drop(columns=["label"]).iloc[0].to_dict()
+    attack = df[df["label"] == 1].drop(columns=["label"]).iloc[0].to_dict()
+    return {
+        "defaults": defaults,
+        "cat_values": cat_values,
+        "normal_example": {k: (v.item() if hasattr(v, "item") else v) for k, v in normal.items()},
+        "attack_example": {k: (v.item() if hasattr(v, "item") else v) for k, v in attack.items()},
+    }
 
 
 def train_models():
-    """训练并对比模型"""
-    # 加载
     csv_path = download_dataset()
-    df = pd.read_csv(csv_path)
-    print(f"数据加载完成: {df.shape}")
+    df = pd.read_csv(csv_path, encoding="utf-8-sig", low_memory=False)
+    print(f"数据加载完成: {df.shape}  (label 恶意占比 {df['label'].mean():.4f})")
 
-    X, y, scaler, feature_names = preprocess(df)
+    X, y, scaler, feature_names, encoders = preprocess(df)
+    print(f"特征数: {len(feature_names)}  类别特征: {list(encoders.keys())}")
 
-    # 切分
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    print(f"切分: train={X_train.shape[0]}  test={X_test.shape[0]}")
 
     results = {}
 
-    # ── Random Forest ──
-    print("\n训练 Random Forest...")
+    print("\n训练 Random Forest (100 trees, max_depth=15)...")
     rf = RandomForestClassifier(n_estimators=100, max_depth=15, random_state=42, n_jobs=-1)
     rf.fit(X_train, y_train)
-    y_pred_rf = rf.predict(X_test)
-
-    rf_metrics = {
-        'accuracy': accuracy_score(y_test, y_pred_rf),
-        'precision': precision_score(y_test, y_pred_rf),
-        'recall': recall_score(y_test, y_pred_rf),
-        'f1': f1_score(y_test, y_pred_rf),
+    yp = rf.predict(X_test)
+    results["Random Forest"] = {
+        "accuracy": accuracy_score(y_test, yp), "precision": precision_score(y_test, yp),
+        "recall": recall_score(y_test, yp), "f1": f1_score(y_test, yp),
     }
-    results['Random Forest'] = rf_metrics
-    print(f"  Accuracy: {rf_metrics['accuracy']:.3f}, F1: {rf_metrics['f1']:.3f}")
+    print(f"  Acc={results['Random Forest']['accuracy']:.4f}  P={results['Random Forest']['precision']:.4f}  R={results['Random Forest']['recall']:.4f}  F1={results['Random Forest']['f1']:.4f}")
 
-    # ── XGBoost ──
-    print("训练 XGBoost...")
-    xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42)
+    print("训练 XGBoost (100 trees, max_depth=6)...")
+    xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1,
+                                  random_state=42, n_jobs=-1, eval_metric="logloss")
     xgb_model.fit(X_train, y_train)
-    y_pred_xgb = xgb_model.predict(X_test)
-
-    xgb_metrics = {
-        'accuracy': accuracy_score(y_test, y_pred_xgb),
-        'precision': precision_score(y_test, y_pred_xgb),
-        'recall': recall_score(y_test, y_pred_xgb),
-        'f1': f1_score(y_test, y_pred_xgb),
+    yp = xgb_model.predict(X_test)
+    results["XGBoost"] = {
+        "accuracy": accuracy_score(y_test, yp), "precision": precision_score(y_test, yp),
+        "recall": recall_score(y_test, yp), "f1": f1_score(y_test, yp),
     }
-    results['XGBoost'] = xgb_metrics
-    print(f"  Accuracy: {xgb_metrics['accuracy']:.3f}, F1: {xgb_metrics['f1']:.3f}")
+    print(f"  Acc={results['XGBoost']['accuracy']:.4f}  P={results['XGBoost']['precision']:.4f}  R={results['XGBoost']['recall']:.4f}  F1={results['XGBoost']['f1']:.4f}")
 
-    # ── 选最佳 ──
-    best = 'Random Forest' if results['Random Forest']['f1'] >= results['XGBoost']['f1'] else 'XGBoost'
-    best_model = rf if best == 'Random Forest' else xgb_model
+    best = "Random Forest" if results["Random Forest"]["f1"] >= results["XGBoost"]["f1"] else "XGBoost"
+    best_model = rf if best == "Random Forest" else xgb_model
     print(f"\n最佳模型: {best}")
 
-    # ── 保存 ──
-    joblib.dump(best_model, os.path.join(MODEL_DIR, 'best_model.pkl'))
-    joblib.dump(scaler, os.path.join(MODEL_DIR, 'scaler.pkl'))
-    joblib.dump(feature_names, os.path.join(MODEL_DIR, 'feature_names.pkl'))
+    joblib.dump(best_model, os.path.join(MODEL_DIR, "best_model.pkl"))
+    joblib.dump(scaler, os.path.join(MODEL_DIR, "scaler.pkl"))
+    joblib.dump(feature_names, os.path.join(MODEL_DIR, "feature_names.pkl"))
+    joblib.dump(encoders, os.path.join(MODEL_DIR, "encoders.pkl"))
+    print(f"模型已保存到 {MODEL_DIR}/")
 
-    print(f"\n模型已保存到 {MODEL_DIR}/")
+    ui_meta = build_ui_meta(df, encoders)
+    with open(os.path.join(MODEL_DIR, "ui_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(ui_meta, f, ensure_ascii=False, indent=2)
+
+    meta = {
+        "samples": int(df.shape[0]), "features": len(feature_names),
+        "test_size": int(X_test.shape[0]), "results": results, "best": best,
+    }
+    with open("metrics.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
     return results, best
 
 
-if __name__ == '__main__':
-    results, best = train_models()
-
-    print("\n" + "=" * 50)
-    print("模型对比结果:")
-    for name, metrics in results.items():
-        print(f"  {name:15s}  Acc={metrics['accuracy']:.3f}  Prec={metrics['precision']:.3f}  Rec={metrics['recall']:.3f}  F1={metrics['f1']:.3f}")
+if __name__ == "__main__":
+    train_models()
